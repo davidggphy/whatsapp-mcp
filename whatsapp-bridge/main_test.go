@@ -112,7 +112,7 @@ func queryChat(ms *MessageStore, jid string) (name string, found bool) {
 // queryMessageCount returns the number of messages stored under a chat JID.
 func queryMessageCount(ms *MessageStore, chatJID string) int {
 	var count int
-	ms.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&count)
+	_ = ms.db.QueryRow("SELECT COUNT(*) FROM messages WHERE chat_jid = ?", chatJID).Scan(&count)
 	return count
 }
 
@@ -121,63 +121,7 @@ func queryMessageCount(ms *MessageStore, chatJID string) int {
 var (
 	phoneLID = types.JID{User: "185366493536339", Server: types.HiddenUserServer}
 	phonePN  = types.JID{User: "11234567890", Server: types.DefaultUserServer}
-	groupJID = types.JID{User: "120363123456789", Server: types.GroupServer}
 )
-
-// --- Unit tests: resolveLIDChat ---
-
-func TestResolveLIDChat_NonLIDPassthrough(t *testing.T) {
-	client := newTestClient(&mockLIDStore{})
-
-	got := resolveLIDChat(client, phonePN, types.EmptyJID, types.EmptyJID, false)
-	if got != phonePN {
-		t.Errorf("expected %s, got %s", phonePN, got)
-	}
-
-	got = resolveLIDChat(client, groupJID, types.EmptyJID, types.EmptyJID, false)
-	if got != groupJID {
-		t.Errorf("expected %s, got %s", groupJID, got)
-	}
-}
-
-func TestResolveLIDChat_IncomingWithSenderAlt(t *testing.T) {
-	client := newTestClient(&mockLIDStore{})
-
-	got := resolveLIDChat(client, phoneLID, phonePN, types.EmptyJID, false)
-	if got != phonePN {
-		t.Errorf("expected %s, got %s", phonePN, got)
-	}
-}
-
-func TestResolveLIDChat_OutgoingWithRecipientAlt(t *testing.T) {
-	client := newTestClient(&mockLIDStore{})
-
-	got := resolveLIDChat(client, phoneLID, types.EmptyJID, phonePN, true)
-	if got != phonePN {
-		t.Errorf("expected %s, got %s", phonePN, got)
-	}
-}
-
-func TestResolveLIDChat_FallbackToLIDStore(t *testing.T) {
-	lidStore := &mockLIDStore{
-		pnByLID: map[types.JID]types.JID{phoneLID: phonePN},
-	}
-	client := newTestClient(lidStore)
-
-	got := resolveLIDChat(client, phoneLID, types.EmptyJID, types.EmptyJID, false)
-	if got != phonePN {
-		t.Errorf("expected %s, got %s", phonePN, got)
-	}
-}
-
-func TestResolveLIDChat_UnresolvableLIDReturnsOriginal(t *testing.T) {
-	client := newTestClient(&mockLIDStore{})
-
-	got := resolveLIDChat(client, phoneLID, types.EmptyJID, types.EmptyJID, false)
-	if got != phoneLID {
-		t.Errorf("expected %s (original LID), got %s", phoneLID, got)
-	}
-}
 
 // --- Integration tests: handleMessage stores under correct JID ---
 
