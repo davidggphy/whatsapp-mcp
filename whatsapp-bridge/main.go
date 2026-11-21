@@ -31,6 +31,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -294,6 +295,12 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "edited_at", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("failed to ensure messages.edited_at column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "original_content", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure messages.original_content column: %w", err)
 	}
 	return nil
 }
@@ -971,6 +978,23 @@ func (store *MessageStore) MarkMessageDeleted(messageID, chatJID string, deleted
 	return err
 }
 
+// MarkMessageEdited applies a MESSAGE_EDIT to the target row: content becomes
+// the new text, edited_at the edit time, and original_content keeps the text
+// as first received (set once, so several edits still keep the first version).
+// Edits older than one already applied are ignored. Unknown targets are a
+// silent no-op, like MarkMessageDeleted. edited_at is stored in UTC so the
+// TEXT comparison orders instants correctly across UTC-offset (DST) changes.
+func (store *MessageStore) MarkMessageEdited(messageID, chatJID, newContent string, editedAt time.Time) error {
+	editedAt = editedAt.UTC()
+	_, err := store.db.Exec(
+		`UPDATE messages SET original_content = COALESCE(original_content, content),
+		   content = ?, edited_at = ?
+		 WHERE id = ? AND chat_jid = ? AND (edited_at IS NULL OR edited_at <= ?)`,
+		newContent, editedAt, messageID, chatJID, editedAt,
+	)
+	return err
+}
+
 // Get messages from a chat
 func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
 	rows, err := store.db.Query(
@@ -1247,6 +1271,15 @@ func extractVCardPhones(vcard string) []string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// ID and ChatJID identify the sent message for /api/edit and /api/revoke.
+	ID      string `json:"id,omitempty"`
+	ChatJID string `json:"chat_jid,omitempty"`
+}
+
+// sentMessage is the stored identity of a message sendWhatsAppMessage sent.
+type sentMessage struct {
+	ID      string
+	ChatJID string
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -1462,6 +1495,45 @@ func handleMessageRevoke(messageStore *MessageStore, msg *waProto.Message, chatJ
 	}
 }
 
+// handleMessageEdit records a MESSAGE_EDIT (the sender changed a message
+// after sending it) on the target row, keeping the original text. Edits
+// arrive as a ProtocolMessage, possibly inside an EditedMessage wrapper that
+// whatsmeow has already unwrapped; their own content is empty, so without
+// this the edit was dropped and the store kept only the first version.
+// Current phone clients send edits as a SecretEncryptedMessage of type
+// MESSAGE_EDIT instead, encrypted with the original message's secret, which
+// whatsmeow keeps for the messages it received or sent and decrypts here.
+func handleMessageEdit(client *whatsmeow.Client, messageStore *MessageStore, evt *events.Message, chatJID string, logger waLog.Logger) {
+	var targetID string
+	var edited *waProto.Message
+	if enc := evt.Message.GetSecretEncryptedMessage(); enc != nil {
+		if enc.GetSecretEncType() != waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+			return
+		}
+		targetID = enc.GetTargetMessageKey().GetID()
+		dec, err := client.DecryptSecretEncryptedMessage(context.Background(), evt)
+		if err != nil {
+			logger.Warnf("Failed to decrypt edit of message %s in %s: %v", targetID, chatJID, err)
+			return
+		}
+		edited = dec
+		if p := dec.GetProtocolMessage(); p.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+			edited = p.GetEditedMessage()
+		}
+	} else if protoMsg := evt.Message.GetProtocolMessage(); protoMsg.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		targetID, edited = protoMsg.GetKey().GetID(), protoMsg.GetEditedMessage()
+	} else {
+		return
+	}
+	newContent := extractTextContent(edited)
+	if targetID == "" || newContent == "" {
+		return
+	}
+	if err := messageStore.MarkMessageEdited(targetID, chatJID, newContent, evt.Info.Timestamp); err != nil {
+		logger.Warnf("Failed to record edit of message %s in %s: %v", targetID, chatJID, err)
+	}
+}
+
 // resolveRecipientJID parses a phone number or JID string and resolves PN -> LID
 // for personal chats before sending.
 func resolveRecipientJID(client *whatsmeow.Client, recipient string) (types.JID, error) {
@@ -1536,9 +1608,9 @@ func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string, sentMessage) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", sentMessage{}
 	}
 
 	mentionedJIDs := resolveMentionJIDs(client, mentions)
@@ -1549,7 +1621,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	if strings.Contains(recipient, "@") {
 		settingsLookupJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), sentMessage{}
 		}
 	} else {
 		settingsLookupJID = types.JID{
@@ -1566,7 +1638,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 	recipientJID, err := resolveRecipientJID(client, recipient)
 	if err != nil {
-		return false, err.Error()
+		return false, err.Error(), sentMessage{}
 	}
 
 	msg := &waProto.Message{}
@@ -1580,7 +1652,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), sentMessage{}
 		}
 
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
@@ -1588,7 +1660,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Upload media to WhatsApp servers
 		upload, err = client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), sentMessage{}
 		}
 
 		// Don't log the struct itself — UploadResponse carries the MediaKey
@@ -1631,7 +1703,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), sentMessage{}
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -1681,7 +1753,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			// Unreachable today (classifyMediaPath only returns the four
 			// types above), but fail loudly rather than send an empty proto
 			// while still persisting media metadata for it.
-			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath)
+			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath), sentMessage{}
 		}
 	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
 		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
@@ -1722,7 +1794,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// recipient would silently miss the disappearing-message settings row.
 	settings, err := messageStore.GetChatEphemeralSettings(resolveUserJID(client, settingsLookupJID, types.EmptyJID).String())
 	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Sprintf("Error loading chat settings: %v", err)
+		return false, fmt.Sprintf("Error loading chat settings: %v", err), sentMessage{}
 	}
 	if err == nil {
 		applyChatEphemeralSettings(msg, settings)
@@ -1732,20 +1804,21 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), sentMessage{}
 	}
+
+	// Normalize @lid recipients to phone JID so outbound rows land in
+	// the same chat row as inbound (which handleMessage normalizes via
+	// resolveLIDChat). Otherwise sending to an @lid input would
+	// fragment the chat under a separate jid.
+	chatJID := resolveUserJID(client, storageJID, types.EmptyJID).String()
+	sent := sentMessage{ID: resp.ID, ChatJID: chatJID}
 
 	// whatsmeow does not re-emit events.Message for messages this client
 	// itself just sent, so without an explicit StoreMessage call here
 	// list_messages / get_last_interaction never see our own outbound
 	// traffic until WhatsApp's multi-device sync echoes them back.
 	if messageStore != nil && client.Store != nil && client.Store.ID != nil {
-		// Normalize @lid recipients to phone JID so outbound rows land in
-		// the same chat row as inbound (which handleMessage normalizes via
-		// resolveLIDChat). Otherwise sending to an @lid input would
-		// fragment the chat under a separate jid.
-		persistJID := resolveUserJID(client, storageJID, types.EmptyJID)
-		chatJID := persistJID.String()
 		senderUser := client.Store.ID.User
 		timestamp := resp.Timestamp
 		if timestamp.IsZero() {
@@ -1768,7 +1841,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), sent
 }
 
 // Extract quoted message info from ContextInfo
@@ -2083,6 +2156,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// inbound reactions, flag it unread — without any new message to show.
 	updateChatEphemeralSettingsFromProtocolMessage(messageStore, chatJID, msg.Message, msg.Info.Timestamp.Unix(), logger)
 	handleMessageRevoke(messageStore, msg.Message, chatJID, msg.Info.Timestamp.Unix(), logger)
+	handleMessageEdit(client, messageStore, msg, chatJID, logger)
 
 	// Backfill ephemeral state from any regular message's ContextInfo.
 	// EPHEMERAL_SETTING ProtocolMessages and GroupInfo events only fire on
@@ -2513,6 +2587,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// On-demand history sync endpoint (see history_ondemand.go)
 	registerHistoryEndpoint(mux, auth, client, messageStore)
+	registerOwnMessageEndpoints(mux, auth, client, messageStore)
 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -2589,7 +2664,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		success, message, sent := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2603,6 +2678,8 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+			ID:      sent.ID,
+			ChatJID: sent.ChatJID,
 		})
 	}))
 
